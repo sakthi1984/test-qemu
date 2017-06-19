@@ -34,6 +34,7 @@
 
 #define PCI_DEVICE_ID_VMWARE_VMXNET3_REVISION 0x1
 #define VMXNET3_MSIX_BAR_SIZE 0x2000
+#define MIN_BUF_SIZE 60
 
 #define VMXNET3_BAR0_IDX      (0)
 #define VMXNET3_BAR1_IDX      (1)
@@ -728,9 +729,7 @@ static void vmxnet3_process_tx_queue(VMXNET3State *s, int qidx)
         }
 
         if (txd.eop) {
-            if (!s->skip_current_tx_pkt) {
-                vmxnet_tx_pkt_parse(s->tx_pkt);
-
+            if (!s->skip_current_tx_pkt && vmxnet_tx_pkt_parse(s->tx_pkt)) {
                 if (s->needs_vlan) {
                     vmxnet_tx_pkt_setup_vlan_header(s->tx_pkt, s->tci);
                 }
@@ -1107,9 +1106,13 @@ vmxnet3_io_bar0_write(void *opaque, hwaddr addr,
 static uint64_t
 vmxnet3_io_bar0_read(void *opaque, hwaddr addr, unsigned size)
 {
+    VMXNET3State *s = opaque;
+
     if (VMW_IS_MULTIREG_ADDR(addr, VMXNET3_REG_IMR,
                         VMXNET3_MAX_INTRS, VMXNET3_REG_ALIGN)) {
-        g_assert_not_reached();
+        int l = VMW_MULTIREG_IDX_BY_ADDR(addr, VMXNET3_REG_IMR,
+                                         VMXNET3_REG_ALIGN);
+        return s->interrupt_states[l].is_masked;
     }
 
     VMW_CBPRN("BAR0 unknown read [%" PRIx64 "], size %d", addr, size);
@@ -1134,8 +1137,13 @@ static void vmxnet3_reset_mac(VMXNET3State *s)
 
 static void vmxnet3_deactivate_device(VMXNET3State *s)
 {
-    VMW_CBPRN("Deactivating vmxnet3...");
-    s->device_active = false;
+    if (s->device_active) {
+        VMW_CBPRN("Deactivating vmxnet3...");
+        vmxnet_tx_pkt_reset(s->tx_pkt);
+        vmxnet_tx_pkt_uninit(s->tx_pkt);
+        vmxnet_rx_pkt_uninit(s->rx_pkt);
+        s->device_active = false;
+    }
 }
 
 static void vmxnet3_reset(VMXNET3State *s)
@@ -1144,7 +1152,6 @@ static void vmxnet3_reset(VMXNET3State *s)
 
     vmxnet3_deactivate_device(s);
     vmxnet3_reset_interrupt_states(s);
-    vmxnet_tx_pkt_reset(s->tx_pkt);
     s->drv_shmem = 0;
     s->tx_sop = true;
     s->skip_current_tx_pkt = false;
@@ -1367,6 +1374,12 @@ static void vmxnet3_activate_device(VMXNET3State *s)
         return;
     }
 
+    /* Verify if device is active */
+    if (s->device_active) {
+        VMW_CFPRN("Vmxnet3 device is active");
+        return;
+    }
+
     vmxnet3_adjust_by_guest_type(s);
     vmxnet3_update_features(s);
     vmxnet3_update_pm_state(s);
@@ -1563,7 +1576,7 @@ static void vmxnet3_handle_command(VMXNET3State *s, uint64_t cmd)
         break;
 
     case VMXNET3_CMD_QUIESCE_DEV:
-        VMW_CBPRN("Set: VMXNET3_CMD_QUIESCE_DEV - pause the device");
+        VMW_CBPRN("Set: VMXNET3_CMD_QUIESCE_DEV - deactivate the device");
         vmxnet3_deactivate_device(s);
         break;
 
@@ -1668,7 +1681,7 @@ vmxnet3_io_bar1_write(void *opaque,
          * shared address only after we get the high part
          */
         if (0 == val) {
-            s->device_active = false;
+            vmxnet3_deactivate_device(s);
         }
         s->temp_shared_guest_driver_memory = val;
         s->drv_shmem = 0;
@@ -1871,10 +1884,19 @@ vmxnet3_receive(NetClientState *nc, const uint8_t *buf, size_t size)
 {
     VMXNET3State *s = qemu_get_nic_opaque(nc);
     size_t bytes_indicated;
+    uint8_t min_buf[MIN_BUF_SIZE];
 
     if (!vmxnet3_can_receive(nc)) {
         VMW_PKPRN("Cannot receive now");
         return -1;
+    }
+
+    /* Pad to minimum Ethernet frame length */
+    if (size < sizeof(min_buf)) {
+        memcpy(min_buf, buf, size);
+        memset(&min_buf[size], 0, sizeof(min_buf) - size);
+        buf = min_buf;
+        size = sizeof(min_buf);
     }
 
     if (s->peer_has_vhdr) {
@@ -1946,9 +1968,7 @@ static bool vmxnet3_peer_has_vnet_hdr(VMXNET3State *s)
 static void vmxnet3_net_uninit(VMXNET3State *s)
 {
     g_free(s->mcast_list);
-    vmxnet_tx_pkt_reset(s->tx_pkt);
-    vmxnet_tx_pkt_uninit(s->tx_pkt);
-    vmxnet_rx_pkt_uninit(s->rx_pkt);
+    vmxnet3_deactivate_device(s);
     qemu_del_nic(s->nic);
 }
 

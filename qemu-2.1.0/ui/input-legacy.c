@@ -60,12 +60,13 @@ static QTAILQ_HEAD(, QEMUPutLEDEntry) led_handlers =
 static QTAILQ_HEAD(, QEMUPutMouseEntry) mouse_handlers =
     QTAILQ_HEAD_INITIALIZER(mouse_handlers);
 
-int index_from_key(const char *key)
+int index_from_key(const char *key, size_t key_length)
 {
     int i;
 
     for (i = 0; QKeyCode_lookup[i] != NULL; i++) {
-        if (!strcmp(key, QKeyCode_lookup[i])) {
+        if (!strncmp(key, QKeyCode_lookup[i], key_length) &&
+            !QKeyCode_lookup[i][key_length]) {
             break;
         }
     }

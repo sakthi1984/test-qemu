@@ -427,7 +427,7 @@ DEF("drive", HAS_ARG, QEMU_OPTION_drive,
     "       [,serial=s][,addr=A][,rerror=ignore|stop|report]\n"
     "       [,werror=ignore|stop|report|enospc][,id=name][,aio=threads|native]\n"
     "       [,readonly=on|off][,copy-on-read=on|off]\n"
-    "       [,detect-zeroes=on|off|unmap]\n"
+    "       [,discard=ignore|unmap][,detect-zeroes=on|off|unmap]\n"
     "       [[,bps=b]|[[,bps_rd=r][,bps_wr=w]]]\n"
     "       [[,iops=i]|[[,iops_rd=r][,iops_wr=w]]]\n"
     "       [[,bps_max=bm]|[[,bps_rd_max=rm][,bps_wr_max=wm]]]\n"
@@ -1349,6 +1349,8 @@ ACPI headers (possible overridden by other options).
 For data=, only data
 portion of the table is used, all header information is specified in the
 command line.
+If a SLIC table is supplied to qemu, then the oem_id from the SLIC table
+will be copied into the RSDT table (this is a Debian addition).
 ETEXI
 
 DEF("smbios", HAS_ARG, QEMU_OPTION_smbios,

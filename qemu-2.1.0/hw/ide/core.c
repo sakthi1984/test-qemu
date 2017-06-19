@@ -676,10 +676,11 @@ void ide_dma_cb(void *opaque, int ret)
     n = s->nsector;
     s->io_buffer_index = 0;
     s->io_buffer_size = n * 512;
-    if (s->bus->dma->ops->prepare_buf(s->bus->dma, ide_cmd_is_read(s)) == 0) {
+    if (s->bus->dma->ops->prepare_buf(s->bus->dma, ide_cmd_is_read(s)) < 512) {
         /* The PRDs were too short. Reset the Active bit, but don't raise an
          * interrupt. */
         s->status = READY_STAT | SEEK_STAT;
+        dma_buf_commit(s);
         goto eot;
     }
 
@@ -688,7 +689,8 @@ void ide_dma_cb(void *opaque, int ret)
            sector_num, n, s->dma_cmd);
 #endif
 
-    if (!ide_sect_range_ok(s, sector_num, n)) {
+    if ((s->dma_cmd == IDE_DMA_READ || s->dma_cmd == IDE_DMA_WRITE) &&
+        !ide_sect_range_ok(s, sector_num, n)) {
         dma_buf_commit(s);
         ide_dma_error(s);
         return;
@@ -1666,11 +1668,11 @@ static const struct {
 } ide_cmd_table[0x100] = {
     /* NOP not implemented, mandatory for CD */
     [CFA_REQ_EXT_ERROR_CODE]      = { cmd_cfa_req_ext_error_code, CFA_OK },
-    [WIN_DSM]                     = { cmd_data_set_management, ALL_OK },
+    [WIN_DSM]                     = { cmd_data_set_management, HD_CFA_OK },
     [WIN_DEVICE_RESET]            = { cmd_device_reset, CD_OK },
     [WIN_RECAL]                   = { cmd_nop, HD_CFA_OK | SET_DSC},
     [WIN_READ]                    = { cmd_read_pio, ALL_OK },
-    [WIN_READ_ONCE]               = { cmd_read_pio, ALL_OK },
+    [WIN_READ_ONCE]               = { cmd_read_pio, HD_CFA_OK },
     [WIN_READ_EXT]                = { cmd_read_pio, HD_CFA_OK },
     [WIN_READDMA_EXT]             = { cmd_read_dma, HD_CFA_OK },
     [WIN_READ_NATIVE_MAX_EXT]     = { cmd_read_native_max, HD_CFA_OK | SET_DSC },
@@ -1689,12 +1691,12 @@ static const struct {
     [CFA_TRANSLATE_SECTOR]        = { cmd_cfa_translate_sector, CFA_OK },
     [WIN_DIAGNOSE]                = { cmd_exec_dev_diagnostic, ALL_OK },
     [WIN_SPECIFY]                 = { cmd_nop, HD_CFA_OK | SET_DSC },
-    [WIN_STANDBYNOW2]             = { cmd_nop, ALL_OK },
-    [WIN_IDLEIMMEDIATE2]          = { cmd_nop, ALL_OK },
-    [WIN_STANDBY2]                = { cmd_nop, ALL_OK },
-    [WIN_SETIDLE2]                = { cmd_nop, ALL_OK },
-    [WIN_CHECKPOWERMODE2]         = { cmd_check_power_mode, ALL_OK | SET_DSC },
-    [WIN_SLEEPNOW2]               = { cmd_nop, ALL_OK },
+    [WIN_STANDBYNOW2]             = { cmd_nop, HD_CFA_OK },
+    [WIN_IDLEIMMEDIATE2]          = { cmd_nop, HD_CFA_OK },
+    [WIN_STANDBY2]                = { cmd_nop, HD_CFA_OK },
+    [WIN_SETIDLE2]                = { cmd_nop, HD_CFA_OK },
+    [WIN_CHECKPOWERMODE2]         = { cmd_check_power_mode, HD_CFA_OK | SET_DSC },
+    [WIN_SLEEPNOW2]               = { cmd_nop, HD_CFA_OK },
     [WIN_PACKETCMD]               = { cmd_packet, CD_OK },
     [WIN_PIDENTIFY]               = { cmd_identify_packet, CD_OK },
     [WIN_SMART]                   = { cmd_smart, HD_CFA_OK | SET_DSC },
@@ -1708,19 +1710,19 @@ static const struct {
     [WIN_WRITEDMA]                = { cmd_write_dma, HD_CFA_OK },
     [WIN_WRITEDMA_ONCE]           = { cmd_write_dma, HD_CFA_OK },
     [CFA_WRITE_MULTI_WO_ERASE]    = { cmd_write_multiple, CFA_OK },
-    [WIN_STANDBYNOW1]             = { cmd_nop, ALL_OK },
-    [WIN_IDLEIMMEDIATE]           = { cmd_nop, ALL_OK },
-    [WIN_STANDBY]                 = { cmd_nop, ALL_OK },
-    [WIN_SETIDLE1]                = { cmd_nop, ALL_OK },
-    [WIN_CHECKPOWERMODE1]         = { cmd_check_power_mode, ALL_OK | SET_DSC },
-    [WIN_SLEEPNOW1]               = { cmd_nop, ALL_OK },
+    [WIN_STANDBYNOW1]             = { cmd_nop, HD_CFA_OK },
+    [WIN_IDLEIMMEDIATE]           = { cmd_nop, HD_CFA_OK },
+    [WIN_STANDBY]                 = { cmd_nop, HD_CFA_OK },
+    [WIN_SETIDLE1]                = { cmd_nop, HD_CFA_OK },
+    [WIN_CHECKPOWERMODE1]         = { cmd_check_power_mode, HD_CFA_OK | SET_DSC },
+    [WIN_SLEEPNOW1]               = { cmd_nop, HD_CFA_OK },
     [WIN_FLUSH_CACHE]             = { cmd_flush_cache, ALL_OK },
     [WIN_FLUSH_CACHE_EXT]         = { cmd_flush_cache, HD_CFA_OK },
     [WIN_IDENTIFY]                = { cmd_identify, ALL_OK },
     [WIN_SETFEATURES]             = { cmd_set_features, ALL_OK | SET_DSC },
     [IBM_SENSE_CONDITION]         = { cmd_ibm_sense_condition, CFA_OK | SET_DSC },
     [CFA_WEAR_LEVEL]              = { cmd_cfa_erase_sectors, HD_CFA_OK | SET_DSC },
-    [WIN_READ_NATIVE_MAX]         = { cmd_read_native_max, ALL_OK | SET_DSC },
+    [WIN_READ_NATIVE_MAX]         = { cmd_read_native_max, HD_CFA_OK | SET_DSC },
 };
 
 static bool ide_cmd_permitted(IDEState *s, uint32_t cmd)
@@ -1929,11 +1931,17 @@ void ide_data_writew(void *opaque, uint32_t addr, uint32_t val)
     }
 
     p = s->data_ptr;
+    if (p + 2 > s->data_end) {
+        return;
+    }
+
     *(uint16_t *)p = le16_to_cpu(val);
     p += 2;
     s->data_ptr = p;
-    if (p >= s->data_end)
+    if (p >= s->data_end) {
+        s->status &= ~DRQ_STAT;
         s->end_transfer_func(s);
+    }
 }
 
 uint32_t ide_data_readw(void *opaque, uint32_t addr)
@@ -1950,11 +1958,17 @@ uint32_t ide_data_readw(void *opaque, uint32_t addr)
     }
 
     p = s->data_ptr;
+    if (p + 2 > s->data_end) {
+        return 0;
+    }
+
     ret = cpu_to_le16(*(uint16_t *)p);
     p += 2;
     s->data_ptr = p;
-    if (p >= s->data_end)
+    if (p >= s->data_end) {
+        s->status &= ~DRQ_STAT;
         s->end_transfer_func(s);
+    }
     return ret;
 }
 
@@ -1971,11 +1985,17 @@ void ide_data_writel(void *opaque, uint32_t addr, uint32_t val)
     }
 
     p = s->data_ptr;
+    if (p + 4 > s->data_end) {
+        return;
+    }
+
     *(uint32_t *)p = le32_to_cpu(val);
     p += 4;
     s->data_ptr = p;
-    if (p >= s->data_end)
+    if (p >= s->data_end) {
+        s->status &= ~DRQ_STAT;
         s->end_transfer_func(s);
+    }
 }
 
 uint32_t ide_data_readl(void *opaque, uint32_t addr)
@@ -1992,11 +2012,17 @@ uint32_t ide_data_readl(void *opaque, uint32_t addr)
     }
 
     p = s->data_ptr;
+    if (p + 4 > s->data_end) {
+        return 0;
+    }
+
     ret = cpu_to_le32(*(uint32_t *)p);
     p += 4;
     s->data_ptr = p;
-    if (p >= s->data_end)
+    if (p >= s->data_end) {
+        s->status &= ~DRQ_STAT;
         s->end_transfer_func(s);
+    }
     return ret;
 }
 
@@ -2211,6 +2237,11 @@ static int ide_nop_int(IDEDMA *dma, int x)
     return 0;
 }
 
+static int32_t ide_nop_int32(IDEDMA *dma, int x)
+{
+    return 0;
+}
+
 static void ide_nop_restart(void *opaque, int x, RunState y)
 {
 }
@@ -2218,7 +2249,7 @@ static void ide_nop_restart(void *opaque, int x, RunState y)
 static const IDEDMAOps ide_dma_nop_ops = {
     .start_dma      = ide_nop_start,
     .start_transfer = ide_nop,
-    .prepare_buf    = ide_nop_int,
+    .prepare_buf    = ide_nop_int32,
     .rw_buf         = ide_nop_int,
     .set_unit       = ide_nop_int,
     .add_status     = ide_nop_int,

@@ -747,6 +747,15 @@ static ssize_t handle_aiocb_rw_linear(RawPosixAIOData *aiocb, char *buf)
         }
         if (len == -1 && errno == EINTR) {
             continue;
+        } else if (len == -1 && errno == EINVAL &&
+                   (aiocb->bs->open_flags & BDRV_O_NOCACHE) &&
+                   !(aiocb->aio_type & QEMU_AIO_WRITE) &&
+                   offset > 0) {
+            /* O_DIRECT pread() may fail with EINVAL when offset is unaligned
+             * after a short read.  Assume that O_DIRECT short reads only occur
+             * at EOF.  Therefore this is a short read, not an I/O error.
+             */
+            break;
         } else if (len == -1) {
             offset = -errno;
             break;
@@ -1410,7 +1419,7 @@ static int64_t try_fiemap(BlockDriverState *bs, off_t start, off_t *data,
 
     f.fm.fm_start = start;
     f.fm.fm_length = (int64_t)nb_sectors * BDRV_SECTOR_SIZE;
-    f.fm.fm_flags = 0;
+    f.fm.fm_flags = FIEMAP_FLAG_SYNC;
     f.fm.fm_extent_count = 1;
     f.fm.fm_reserved = 0;
     if (ioctl(s->fd, FS_IOC_FIEMAP, &f) == -1) {
@@ -1499,9 +1508,9 @@ static int64_t coroutine_fn raw_co_get_block_status(BlockDriverState *bs,
 
     start = sector_num * BDRV_SECTOR_SIZE;
 
-    ret = try_fiemap(bs, start, &data, &hole, nb_sectors, pnum);
+    ret = try_seek_hole(bs, start, &data, &hole, pnum);
     if (ret < 0) {
-        ret = try_seek_hole(bs, start, &data, &hole, pnum);
+        ret = try_fiemap(bs, start, &data, &hole, nb_sectors, pnum);
         if (ret < 0) {
             /* Assume everything is allocated. */
             data = 0;

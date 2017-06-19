@@ -1,0 +1,41 @@
+From: Alexander Graf <agraf@suse.de>
+Date: Fri, 7 Nov 2014 21:12:48 +0000 (+0100)
+Subject: kvm: Fix memory slot page alignment logic
+X-Git-Tag: v2.2.0-rc3~8^2~1
+X-Git-Url: http://git.qemu.org/?p=qemu.git;a=commitdiff_plain;h=f2a64032a14c642d0ddc9a7a846fc3d737deede5
+
+kvm: Fix memory slot page alignment logic
+
+Memory slots have to be page aligned to get entered into KVM. There
+is existing logic that tries to ensure that we pad memory slots that
+are not page aligned to the biggest region that would still fit in the
+alignment requirements.
+
+Unfortunately, that logic is broken. It tries to calculate the start
+offset based on the region size.
+
+Fix up the logic to do the thing it was intended to do and document it
+properly in the comment above it.
+
+With this patch applied, I can successfully run an e500 guest with more
+than 3GB RAM (at which point RAM starts overlapping subpage memory regions).
+
+Cc: qemu-stable@nongnu.org
+Signed-off-by: Alexander Graf <agraf@suse.de>
+---
+
+--- a/kvm-all.c
++++ b/kvm-all.c
+@@ -625,8 +625,10 @@
+     unsigned delta;
+ 
+     /* kvm works in page size chunks, but the function may be called
+-       with sub-page size and unaligned start address. */
+-    delta = TARGET_PAGE_ALIGN(size) - size;
++       with sub-page size and unaligned start address. Pad the start
++       address to next and truncate size to previous page boundary. */
++    delta = (TARGET_PAGE_SIZE - (start_addr & ~TARGET_PAGE_MASK));
++    delta &= ~TARGET_PAGE_MASK;
+     if (delta > size) {
+         return;
+     }

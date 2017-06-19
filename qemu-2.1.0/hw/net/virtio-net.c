@@ -125,10 +125,23 @@ static void virtio_net_vhost_status(VirtIONet *n, uint8_t status)
         return;
     }
     if (!n->vhost_started) {
-        int r;
+        int r, i;
+
         if (!vhost_net_query(get_vhost_net(nc->peer), vdev)) {
             return;
         }
+
+        /* Any packets outstanding? Purge them to avoid touching rings
+         * when vhost is running.
+         */
+        for (i = 0;  i < queues; i++) {
+            NetClientState *qnc = qemu_get_subqueue(n->nic, i);
+
+            /* Purge both directions: TX and RX. */
+            qemu_net_queue_purge(qnc->peer->incoming_queue, qnc);
+            qemu_net_queue_purge(qnc->incoming_queue, qnc->peer);
+        }
+
         n->vhost_started = 1;
         r = vhost_net_start(vdev, n->nic->ncs, queues);
         if (r < 0) {
@@ -1056,13 +1069,7 @@ static ssize_t virtio_net_receive(NetClientState *nc, const uint8_t *buf, size_t
          * must have consumed the complete packet.
          * Otherwise, drop it. */
         if (!n->mergeable_rx_bufs && offset < size) {
-#if 0
-            error_report("virtio-net truncated non-mergeable packet: "
-                         "i %zd mergeable %d offset %zd, size %zd, "
-                         "guest hdr len %zd, host hdr len %zd",
-                         i, n->mergeable_rx_bufs,
-                         offset, size, n->guest_hdr_len, n->host_hdr_len);
-#endif
+            virtqueue_discard(q->rx_vq, &elem, total);
             return size;
         }
 
@@ -1111,8 +1118,6 @@ static int32_t virtio_net_flush_tx(VirtIONetQueue *q)
     if (!(vdev->status & VIRTIO_CONFIG_S_DRIVER_OK)) {
         return num_packets;
     }
-
-    assert(vdev->vm_running);
 
     if (q->async_tx.elem.out_num) {
         virtio_queue_set_notification(q->tx_vq, 0);
@@ -1224,7 +1229,12 @@ static void virtio_net_tx_timer(void *opaque)
     VirtIONetQueue *q = opaque;
     VirtIONet *n = q->n;
     VirtIODevice *vdev = VIRTIO_DEVICE(n);
-    assert(vdev->vm_running);
+    /* This happens when device was stopped but BH wasn't. */
+    if (!vdev->vm_running) {
+        /* Make sure tx waiting is set, so we'll run when restarted. */
+        assert(q->tx_waiting);
+        return;
+    }
 
     q->tx_waiting = 0;
 
@@ -1244,7 +1254,12 @@ static void virtio_net_tx_bh(void *opaque)
     VirtIODevice *vdev = VIRTIO_DEVICE(n);
     int32_t ret;
 
-    assert(vdev->vm_running);
+    /* This happens when device was stopped but BH wasn't. */
+    if (!vdev->vm_running) {
+        /* Make sure tx waiting is set, so we'll run when restarted. */
+        assert(q->tx_waiting);
+        return;
+    }
 
     q->tx_waiting = 0;
 

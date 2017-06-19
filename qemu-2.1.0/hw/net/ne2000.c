@@ -230,6 +230,9 @@ ssize_t ne2000_receive(NetClientState *nc, const uint8_t *buf, size_t size_)
     }
 
     index = s->curpag << 8;
+    if (index >= NE2000_PMEM_END) {
+        index = s->start;
+    }
     /* 4 bytes for header */
     total_len = size + 4;
     /* address for next packet (4 bytes for CRC) */
@@ -253,7 +256,7 @@ ssize_t ne2000_receive(NetClientState *nc, const uint8_t *buf, size_t size_)
         if (index <= s->stop)
             avail = s->stop - index;
         else
-            avail = 0;
+            break;
         len = size;
         if (len > avail)
             len = avail;
@@ -315,13 +318,19 @@ static void ne2000_ioport_write(void *opaque, uint32_t addr, uint32_t val)
         offset = addr | (page << 4);
         switch(offset) {
         case EN0_STARTPG:
-            s->start = val << 8;
+            if (val << 8 <= NE2000_PMEM_END) {
+                s->start = val << 8;
+            }
             break;
         case EN0_STOPPG:
-            s->stop = val << 8;
+            if (val << 8 <= NE2000_PMEM_END) {
+                s->stop = val << 8;
+            }
             break;
         case EN0_BOUNDARY:
-            s->boundary = val;
+            if (val << 8 < NE2000_PMEM_END) {
+                s->boundary = val;
+            }
             break;
         case EN0_IMR:
             s->imr = val;
@@ -362,7 +371,9 @@ static void ne2000_ioport_write(void *opaque, uint32_t addr, uint32_t val)
             s->phys[offset - EN1_PHYS] = val;
             break;
         case EN1_CURPAG:
-            s->curpag = val;
+            if (val << 8 < NE2000_PMEM_END) {
+                s->curpag = val;
+            }
             break;
         case EN1_MULT ... EN1_MULT + 7:
             s->mult[offset - EN1_MULT] = val;
@@ -465,8 +476,9 @@ static inline void ne2000_mem_writel(NE2000State *s, uint32_t addr,
                                      uint32_t val)
 {
     addr &= ~1; /* XXX: check exact behaviour if not even */
-    if (addr < 32 ||
-        (addr >= NE2000_PMEM_START && addr < NE2000_MEM_SIZE)) {
+    if (addr < 32
+        || (addr >= NE2000_PMEM_START
+            && addr + sizeof(uint32_t) <= NE2000_MEM_SIZE)) {
         stl_le_p(s->mem + addr, val);
     }
 }
@@ -495,8 +507,9 @@ static inline uint32_t ne2000_mem_readw(NE2000State *s, uint32_t addr)
 static inline uint32_t ne2000_mem_readl(NE2000State *s, uint32_t addr)
 {
     addr &= ~1; /* XXX: check exact behaviour if not even */
-    if (addr < 32 ||
-        (addr >= NE2000_PMEM_START && addr < NE2000_MEM_SIZE)) {
+    if (addr < 32
+        || (addr >= NE2000_PMEM_START
+            && addr + sizeof(uint32_t) <= NE2000_MEM_SIZE)) {
         return ldl_le_p(s->mem + addr);
     } else {
         return 0xffffffff;

@@ -245,6 +245,8 @@ static void acpi_get_pci_info(PcPciInfo *info)
 #define ACPI_BUILD_TABLE_FILE "etc/acpi/tables"
 #define ACPI_BUILD_RSDP_FILE "etc/acpi/rsdp"
 
+extern size_t slic_table_offset;
+
 static void
 build_header(GArray *linker, GArray *table_data,
              AcpiTableHeader *h, const char *sig, int len, uint8_t rev)
@@ -258,6 +260,11 @@ build_header(GArray *linker, GArray *table_data,
     h->oem_revision = cpu_to_le32(1);
     memcpy(h->asl_compiler_id, ACPI_BUILD_APPNAME4, 4);
     h->asl_compiler_revision = cpu_to_le32(1);
+    if (memcmp(sig, "RSDT", 4) == 0 && slic_table_offset) {
+      /* for win7: OEM info in RSDT and SLIC should be the same */
+      AcpiTableHeader *s = (AcpiTableHeader *)(acpi_tables + slic_table_offset);
+      memcpy(h->oem_id, s->oem_id, 6 + 4 + 4);
+    }
     h->checksum = 0;
     /* Checksum to be filled in by Guest linker */
     bios_linker_loader_add_checksum(linker, ACPI_BUILD_TABLE_FILE,
@@ -546,6 +553,12 @@ static void fadt_setup(AcpiFadtDescriptorRev1 *fadt, AcpiPmInfo *pm)
                               (1 << ACPI_FADT_F_SLP_BUTTON) |
                               (1 << ACPI_FADT_F_RTC_S4));
     fadt->flags |= cpu_to_le32(1 << ACPI_FADT_F_USE_PLATFORM_CLOCK);
+    /* APIC destination mode ("Flat Logical") has an upper limit of 8 CPUs
+     * For more than 8 CPUs, "Clustered Logical" mode has to be used
+     */
+    if (max_cpus > 8) {
+        fadt->flags |= cpu_to_le32(1 << ACPI_FADT_F_FORCE_APIC_CLUSTER_MODEL);
+    }
 }
 
 
@@ -1393,7 +1406,7 @@ build_rsdp(GArray *rsdp_table, GArray *linker, unsigned rsdt)
 {
     AcpiRsdpDescriptor *rsdp = acpi_data_push(rsdp_table, sizeof *rsdp);
 
-    bios_linker_loader_alloc(linker, ACPI_BUILD_RSDP_FILE, 1,
+    bios_linker_loader_alloc(linker, ACPI_BUILD_RSDP_FILE, 16,
                              true /* fseg memory */);
 
     memcpy(&rsdp->signature, "RSD PTR ", 8);

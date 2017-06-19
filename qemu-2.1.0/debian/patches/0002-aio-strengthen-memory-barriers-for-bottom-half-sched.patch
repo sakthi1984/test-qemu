@@ -1,0 +1,148 @@
+From 5646d5f4cca5e5c9c812cf3733639d0d9fa8466c Mon Sep 17 00:00:00 2001
+From: Paolo Bonzini <pbonzini@redhat.com>
+Date: Tue, 7 Apr 2015 17:16:19 +0200
+Subject: [PATCH 2/2] aio: strengthen memory barriers for bottom half
+ scheduling
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+There are two problems with memory barriers in async.c.  The fix is
+to use atomic_xchg in order to achieve sequential consistency between
+the scheduling of a bottom half and the corresponding execution.
+
+First, if bh->scheduled is already 1 in qemu_bh_schedule, QEMU does
+not execute a memory barrier to order any writes needed by the callback
+before the read of bh->scheduled.  If the other side sees req->state as
+THREAD_ACTIVE, the callback is not invoked and you get deadlock.
+
+Second, the memory barrier in aio_bh_poll is too weak.  Without this
+patch, it is possible that bh->scheduled = 0 is not "published" until
+after the callback has returned.  Another thread wants to schedule the
+bottom half, but it sees bh->scheduled = 1 and does nothing.  This causes
+a lost wakeup.  The memory barrier should have been changed to smp_mb()
+in commit 924fe12 (aio: fix qemu_bh_schedule() bh->ctx race condition,
+2014-06-03) together with qemu_bh_schedule()'s.  Guess who reviewed
+that patch?
+
+Both of these involve a store and a load, so they are reproducible on
+x86_64 as well.  It is however much easier on aarch64, where the
+libguestfs test suite triggers the bug fairly easily.  Even there the
+failure can go away or appear depending on compiler optimization level,
+tracing options, or even kernel debugging options.
+
+Paul Leveille however reported how to trigger the problem within 15
+minutes on x86_64 as well.  His (untested) recipe, reproduced here
+for reference, is the following:
+
+   1) Qcow2 (or 3) is critical – raw files alone seem to avoid the problem.
+
+   2) Use “cache=directsync” rather than the default of
+   “cache=none” to make it happen easier.
+
+   3) Use a server with a write-back RAID controller to allow for rapid
+   IO rates.
+
+   4) Run a random-access load that (mostly) writes chunks to various
+   files on the virtual block device.
+
+      a. I use ‘diskload.exe c:25’, a Microsoft HCT load
+         generator, on Windows VMs.
+
+      b. Iometer can probably be configured to generate a similar load.
+
+   5) Run multiple VMs in parallel, against the same storage device,
+   to shake the failure out sooner.
+
+   6) IvyBridge and Haswell processors for certain; not sure about others.
+
+A similar patch survived over 12 hours of testing, where an unpatched
+QEMU would fail within 15 minutes.
+
+This bug is, most likely, also the cause of failures in the libguestfs
+testsuite on AArch64.
+
+Thanks to Laszlo Ersek for initially reporting this bug, to Stefan
+Hajnoczi for suggesting closer examination of qemu_bh_schedule, and to
+Paul for providing test input and a prototype patch.
+
+Reported-by: Laszlo Ersek <lersek@redhat.com>
+Reported-by: Paul Leveille <Paul.Leveille@stratus.com>
+Reported-by: John Snow <jsnow@redhat.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Message-id: 1428419779-26062-1-git-send-email-pbonzini@redhat.com
+Suggested-by: Paul Leveille <Paul.Leveille@stratus.com>
+Suggested-by: Stefan Hajnoczi <stefanha@redhat.com>
+Signed-off-by: Paolo Bonzini <pbonzini@redhat.com>
+Signed-off-by: Stefan Hajnoczi <stefanha@redhat.com>
+(cherry picked from commit e8d3b1a25f284cdf9705b7cf0412281cc9ee3a36)
+---
+ async.c | 28 ++++++++++++----------------
+ 1 file changed, 12 insertions(+), 16 deletions(-)
+
+diff --git a/async.c b/async.c
+index 5b6fe6b..a746c7c 100644
+--- a/async.c
++++ b/async.c
+@@ -69,12 +69,13 @@ int aio_bh_poll(AioContext *ctx)
+         /* Make sure that fetching bh happens before accessing its members */
+         smp_read_barrier_depends();
+         next = bh->next;
+-        if (!bh->deleted && bh->scheduled) {
+-            bh->scheduled = 0;
+-            /* Paired with write barrier in bh schedule to ensure reading for
+-             * idle & callbacks coming after bh's scheduling.
+-             */
+-            smp_rmb();
++        /* The atomic_xchg is paired with the one in qemu_bh_schedule.  The
++         * implicit memory barrier ensures that the callback sees all writes
++         * done by the scheduling thread.  It also ensures that the scheduling
++         * thread sees the zero before bh->cb has run, and thus will call
++         * aio_notify again if necessary.
++         */
++        if (!bh->deleted && atomic_xchg(&bh->scheduled, 0)) {
+             if (!bh->idle)
+                 ret = 1;
+             bh->idle = 0;
+@@ -105,33 +106,28 @@ int aio_bh_poll(AioContext *ctx)
+ 
+ void qemu_bh_schedule_idle(QEMUBH *bh)
+ {
+-    if (bh->scheduled)
+-        return;
+     bh->idle = 1;
+     /* Make sure that idle & any writes needed by the callback are done
+      * before the locations are read in the aio_bh_poll.
+      */
+-    smp_wmb();
+-    bh->scheduled = 1;
++    atomic_mb_set(&bh->scheduled, 1);
+ }
+ 
+ void qemu_bh_schedule(QEMUBH *bh)
+ {
+     AioContext *ctx;
+ 
+-    if (bh->scheduled)
+-        return;
+     ctx = bh->ctx;
+     bh->idle = 0;
+-    /* Make sure that:
++    /* The memory barrier implicit in atomic_xchg makes sure that:
+      * 1. idle & any writes needed by the callback are done before the
+      *    locations are read in the aio_bh_poll.
+      * 2. ctx is loaded before scheduled is set and the callback has a chance
+      *    to execute.
+      */
+-    smp_mb();
+-    bh->scheduled = 1;
+-    aio_notify(ctx);
++    if (atomic_xchg(&bh->scheduled, 1) == 0) {
++        aio_notify(ctx);
++    }
+ }
+ 
+ 
+-- 
+2.9.3
+
